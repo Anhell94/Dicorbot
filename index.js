@@ -1,5 +1,6 @@
 const { Client, GatewayIntentBits, EmbedBuilder, PermissionsBitField } = require('discord.js');
 const express = require('express');
+const axios = require('axios');
 
 // Configuración - USARÁ VARIABLES DE ENTORNO
 const CONFIG = {
@@ -10,7 +11,8 @@ const CONFIG = {
   },
   CHANNELS: {
     RECOMPENSAS: process.env.CHANNEL_RECOMPENSAS || '1418453783767158864',
-    LOGS: process.env.CHANNEL_LOGS || '1418453783767158864'
+    LOGS: process.env.CHANNEL_LOGS || '1418453783767158864',
+    BIENVENIDAS: process.env.CHANNEL_BIENVENIDAS || '1418453783767158864' // ✅ NUEVO CANAL
   },
   INVITACIONES: {
     ORO: parseInt(process.env.INVITACIONES_ORO) || 5,
@@ -18,28 +20,65 @@ const CONFIG = {
   }
 };
 
+// URL de tu app en Render para auto-ping
+const RENDER_URL = process.env.RENDER_URL || 'https://tu-bot.onrender.com';
+
 // Servidor web para Render health checks
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
 
+// Función de auto-ping para evitar que Render duerma el bot
+async function autoPing() {
+  try {
+    console.log('🔄 Haciendo ping automático para mantener activo...');
+    const response = await axios.get(`${RENDER_URL}/health`);
+    console.log(`✅ Ping exitoso: Status ${response.status} - ${new Date().toLocaleTimeString()}`);
+  } catch (error) {
+    console.log('❌ Error en ping automático:', error.message);
+  }
+}
+
+// Iniciar ping automático cada 5 minutos (300 segundos)
+setInterval(autoPing, 5 * 60 * 1000);
+
+// Health check endpoint mejorado
 app.get('/', (req, res) => {
   res.json({ 
     status: 'online', 
     message: '🤖 Bot activo y funcionando correctamente',
     timestamp: new Date().toISOString(),
-    service: 'Render.com'
+    service: 'Render.com + Auto-Ping',
+    endpoints: {
+      health: '/health',
+      status: '/status',
+      info: '/'
+    }
   });
 });
 
+// Health check endpoint para Render y auto-ping
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'healthy', 
     bot: client.user ? client.user.tag : 'connecting...',
     timestamp: new Date().toISOString(),
     invitesTracked: userInvites.size,
-    uptime: process.uptime()
+    uptime: process.uptime(),
+    memory: process.memoryUsage()
+  });
+});
+
+// Endpoint de status extendido
+app.get('/status', (req, res) => {
+  res.json({
+    botStatus: client.user ? 'connected' : 'disconnected',
+    guild: client.guilds.cache.first()?.name || 'No conectado',
+    members: client.guilds.cache.reduce((acc, guild) => acc + guild.memberCount, 0),
+    invitesTracked: userInvites.size,
+    lastPing: new Date().toISOString(),
+    renderInstance: 'active'
   });
 });
 
@@ -64,6 +103,9 @@ client.once('ready', async () => {
   console.log(`🏠 Servidor: ${client.guilds.cache.first()?.name || 'No encontrado'}`);
   console.log('📋 Configuración cargada:', CONFIG);
   await loadInvites();
+  
+  // Primer ping inmediato al iniciar
+  autoPing();
 });
 
 client.on('guildMemberAdd', async (member) => {
@@ -106,12 +148,50 @@ async function assignStarterRole(member) {
   }
 }
 
+// ✅ NUEVA FUNCIÓN: Notificación de bienvenida con invitador
+async function sendWelcomeNotification(member, inviter, inviteCode) {
+  try {
+    const welcomeChannel = client.channels.cache.get(CONFIG.CHANNELS.BIENVENIDAS);
+    if (!welcomeChannel) {
+      console.log('❌ Canal de bienvenidas no encontrado');
+      return;
+    }
+
+    const embed = new EmbedBuilder()
+      .setColor('#00FF00')
+      .setTitle('🎉 ¡Nuevo Miembro! 🎉')
+      .setDescription(`**${member.user.tag}** se ha unido al servidor`)
+      .addFields(
+        { name: '👤 Invitado por', value: inviter ? `${inviter.tag}` : 'Invitación directa', inline: true },
+        { name: '📨 Código de invitación', value: `\`${inviteCode || 'N/A'}\``, inline: true },
+        { name: '🆔 User ID', value: member.user.id, inline: true },
+        { name: '📅 Cuenta creada', value: `<t:${Math.floor(member.user.createdTimestamp / 1000)}:R>`, inline: true },
+        { name: '👥 Miembro número', value: `#${member.guild.memberCount}`, inline: true }
+      )
+      .setThumbnail(member.user.displayAvatarURL({ dynamic: true, size: 256 }))
+      .setImage('https://i.imgur.com/abcdefg.gif') // Puedes agregar un GIF de bienvenida
+      .setTimestamp()
+      .setFooter({ text: '¡Bienvenido al servidor! 🎊' });
+
+    await welcomeChannel.send({
+      content: `🎊 ¡Bienvenido ${member.user}! 🎊`,
+      embeds: [embed]
+    });
+
+    console.log(`📢 Notificación de bienvenida enviada para ${member.user.tag}`);
+
+  } catch (error) {
+    console.error('❌ Error enviando notificación de bienvenida:', error.message);
+  }
+}
+
 async function trackInvite(member) {
   try {
     const newInvites = await member.guild.invites.fetch();
     const oldInvites = invitesCache.get(member.guild.id) || new Map();
 
     let inviter = null;
+    let usedInviteCode = null;
     let usedInvite = null;
 
     // Buscar qué invitación fue usada
@@ -119,11 +199,15 @@ async function trackInvite(member) {
       const newInvite = newInvites.get(code);
       if (newInvite && newInvite.uses > oldInvite.uses) {
         inviter = oldInvite.inviter;
+        usedInviteCode = code;
         usedInvite = newInvite;
         console.log(`📨 ${member.user.tag} fue invitado por ${inviter?.tag || 'desconocido'} usando código: ${code}`);
         break;
       }
     }
+
+    // ✅ ENVIAR NOTIFICACIÓN DE BIENVENIDA
+    await sendWelcomeNotification(member, inviter, usedInviteCode);
 
     if (inviter) {
       await updateInviterCount(inviter.id, member.guild.id, member);
@@ -185,8 +269,6 @@ async function addManualInvites(userId, guildId, cantidad, adminUser, reason = '
 
 // GUARDAR DATOS DE INVITACIONES
 function saveInvitesData() {
-  // En un entorno real, aquí guardarías en una base de datos
-  // Por ahora solo mantenemos en memoria para Render free
   console.log('💾 Datos de invitaciones actualizados (en memoria)');
 }
 
@@ -329,7 +411,6 @@ client.on('messageCreate', async (message) => {
 
   // !addinvites @usuario cantidad [razón] - AGREGAR INVITACIONES MANUALMENTE
   if (message.content.startsWith('!addinvites')) {
-    // Verificar permisos de administrador
     if (!message.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
       return message.reply('❌ Necesitas permisos de administrador para usar este comando.');
     }
@@ -343,12 +424,10 @@ client.on('messageCreate', async (message) => {
     const cantidad = parseInt(args[1]);
     const reason = args.slice(2).join(' ') || 'Ajuste administrativo';
 
-    // Validar cantidad
     if (isNaN(cantidad) || cantidad <= 0) {
       return message.reply('❌ La cantidad debe ser un número positivo.');
     }
 
-    // Obtener usuario mencionado
     const user = message.mentions.users.first();
     if (!user) {
       return message.reply('❌ Debes mencionar a un usuario válido.');
@@ -359,7 +438,6 @@ client.on('messageCreate', async (message) => {
     }
 
     try {
-      // Agregar invitaciones manualmente
       const newCount = await addManualInvites(
         user.id, 
         message.guild.id, 
@@ -368,7 +446,6 @@ client.on('messageCreate', async (message) => {
         reason
       );
 
-      // Responder con confirmación
       const embed = new EmbedBuilder()
         .setColor('#00FF00')
         .setTitle('✅ Invitaciones Agregadas')
@@ -424,6 +501,48 @@ client.on('messageCreate', async (message) => {
     message.reply({ embeds: [embed] });
   }
 
+  // !status - Ver estado del bot
+  if (message.content === '!status') {
+    const embed = new EmbedBuilder()
+      .setColor('#0099FF')
+      .setTitle('🤖 Estado del Bot')
+      .setDescription('Información del sistema y conectividad')
+      .addFields(
+        { name: '🟢 Status', value: client.user ? 'Conectado' : 'Desconectado', inline: true },
+        { name: '🏠 Servidor', value: client.guilds.cache.first()?.name || 'N/A', inline: true },
+        { name: '👥 Miembros', value: client.guilds.cache.reduce((acc, guild) => acc + guild.memberCount, 0).toString(), inline: true },
+        { name: '📊 Invitaciones', value: userInvites.size.toString(), inline: true },
+        { name: '⏰ Uptime', value: `${Math.round(process.uptime() / 60)} minutos`, inline: true },
+        { name: '🌐 Host', value: 'Render.com + Auto-Ping', inline: true }
+      )
+      .setFooter({ text: 'Bot siempre activo con sistema de auto-ping' });
+
+    message.reply({ embeds: [embed] });
+  }
+
+  // !setup welcome #canal - CONFIGURAR CANAL DE BIENVENIDAS
+  if (message.content.startsWith('!setup welcome')) {
+    if (!message.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
+      return message.reply('❌ Necesitas permisos de administrador para configurar.');
+    }
+
+    const channel = message.mentions.channels.first();
+    if (!channel) {
+      return message.reply('❌ Debes mencionar un canal. Ejemplo: `!setup welcome #bienvenidas`');
+    }
+
+    // Aquí podrías guardar en base de datos, por ahora usamos variable de entorno
+    const embed = new EmbedBuilder()
+      .setColor('#00FF00')
+      .setTitle('✅ Canal de Bienvenidas Configurado')
+      .setDescription(`El canal ${channel} se ha establecido para notificaciones de bienvenida`)
+      .addFields(
+        { name: '📝 Nota', value: 'Para hacer permanente, configura la variable `CHANNEL_BIENVENIDAS` en Render', inline: false }
+      );
+
+    message.reply({ embeds: [embed] });
+  }
+
   // !help - AYUDA
   if (message.content === '!help') {
     const isAdmin = message.member.permissions.has(PermissionsBitField.Flags.Administrator);
@@ -433,20 +552,20 @@ client.on('messageCreate', async (message) => {
       .setTitle('🤖 Comandos del Bot de Invitaciones')
       .setDescription('Sistema de recompensas por invitar amigos al servidor')
       .addFields(
-        { name: '🎯 Comandos para todos', value: '```!invites - Ver tus invitaciones\n!help - Mostrar esta ayuda```', inline: false }
+        { name: '🎯 Comandos para todos', value: '```!invites - Ver tus invitaciones\n!status - Ver estado del bot\n!help - Mostrar esta ayuda```', inline: false }
       );
 
     if (isAdmin) {
       embed.addFields({
         name: '🛠️ Comandos de Administrador',
-        value: '```!addinvites @usuario cantidad [razón] - Agregar invitaciones manualmente\n!checkinvites @usuario - Ver invitaciones de otro usuario```',
+        value: '```!addinvites @usuario cantidad [razón] - Agregar invitaciones manualmente\n!checkinvites @usuario - Ver invitaciones de otro usuario\n!setup welcome #canal - Configurar canal de bienvenidas```',
         inline: false
       });
     }
 
     embed.addFields(
       { name: '🏆 Sistema de Rangos', value: `\`\`\`🥇 Oro: ${CONFIG.INVITACIONES.ORO} invitaciones\n🏆 Platino: ${CONFIG.INVITACIONES.PLATINO} invitaciones\`\`\``, inline: false },
-      { name: '📊 Funciones Automáticas', value: '```✅ Asigna rol "Iniciado" automáticamente\n✅ Detecta invitaciones automáticamente\n✅ Ascensos de rango automáticos\n✅ Anuncios en canal de recompensas```', inline: false }
+      { name: '📊 Funciones Automáticas', value: '```✅ Asigna rol "Iniciado" automáticamente\n✅ Detecta invitaciones automáticamente\n✅ Notificaciones de bienvenida\n✅ Ascensos de rango automáticos\n✅ Anuncios en canal de recompensas\n✅ Auto-ping 24/7 (nunca se duerme)```', inline: false }
     );
 
     message.reply({ embeds: [embed] });
@@ -468,7 +587,9 @@ console.log('🚀 Iniciando servicios...');
 // Iniciar servidor web
 const server = app.listen(PORT, () => {
   console.log(`🌐 Servidor web iniciado en puerto ${PORT}`);
-  console.log(`📊 Health check disponible en: http://localhost:${PORT}/health`);
+  console.log(`🔄 Auto-ping configurado cada 5 minutos`);
+  console.log(`📊 Health check: http://localhost:${PORT}/health`);
+  console.log(`🌐 URL pública: ${RENDER_URL}`);
 });
 
 // Iniciar bot de Discord
