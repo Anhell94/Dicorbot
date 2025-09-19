@@ -1,6 +1,6 @@
 const { Client, GatewayIntentBits, EmbedBuilder, PermissionsBitField } = require('discord.js');
 const express = require('express');
-const axios = require('axios');
+const http = require('http'); // ✅ Usamos el módulo nativo http
 
 // Configuración - USARÁ VARIABLES DE ENTORNO
 const CONFIG = {
@@ -12,7 +12,7 @@ const CONFIG = {
   CHANNELS: {
     RECOMPENSAS: process.env.CHANNEL_RECOMPENSAS || '1418453783767158864',
     LOGS: process.env.CHANNEL_LOGS || '1418453783767158864',
-    BIENVENIDAS: process.env.CHANNEL_BIENVENIDAS || '1418453783767158864' // ✅ NUEVO CANAL
+    BIENVENIDAS: process.env.CHANNEL_BIENVENIDAS || '1418453783767158864'
   },
   INVITACIONES: {
     ORO: parseInt(process.env.INVITACIONES_ORO) || 5,
@@ -29,18 +29,37 @@ const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
 
-// Función de auto-ping para evitar que Render duerma el bot
-async function autoPing() {
-  try {
-    console.log('🔄 Haciendo ping automático para mantener activo...');
-    const response = await axios.get(`${RENDER_URL}/health`);
-    console.log(`✅ Ping exitoso: Status ${response.status} - ${new Date().toLocaleTimeString()}`);
-  } catch (error) {
+// ✅ NUEVO: Función de auto-ping SIN axios (usando http nativo)
+function autoPing() {
+  console.log('🔄 Haciendo ping automático para mantener activo...');
+  
+  const url = new URL(`${RENDER_URL}/health`);
+  
+  const options = {
+    hostname: url.hostname,
+    port: url.port || (url.protocol === 'https:' ? 443 : 80),
+    path: url.pathname,
+    method: 'GET',
+    timeout: 10000 // 10 segundos timeout
+  };
+
+  const req = http.request(options, (res) => {
+    console.log(`✅ Ping exitoso: Status ${res.statusCode} - ${new Date().toLocaleTimeString()}`);
+  });
+
+  req.on('error', (error) => {
     console.log('❌ Error en ping automático:', error.message);
-  }
+  });
+
+  req.on('timeout', () => {
+    console.log('⏰ Ping timeout - Render puede estar iniciando');
+    req.destroy();
+  });
+
+  req.end();
 }
 
-// Iniciar ping automático cada 5 minutos (300 segundos)
+// ✅ Iniciar ping automático cada 5 minutos (300 segundos)
 setInterval(autoPing, 5 * 60 * 1000);
 
 // Health check endpoint mejorado
@@ -104,7 +123,7 @@ client.once('ready', async () => {
   console.log('📋 Configuración cargada:', CONFIG);
   await loadInvites();
   
-  // Primer ping inmediato al iniciar
+  // ✅ Primer ping inmediato al iniciar
   autoPing();
 });
 
@@ -148,7 +167,7 @@ async function assignStarterRole(member) {
   }
 }
 
-// ✅ NUEVA FUNCIÓN: Notificación de bienvenida con invitador
+// ✅ FUNCIÓN: Notificación de bienvenida con invitador
 async function sendWelcomeNotification(member, inviter, inviteCode) {
   try {
     const welcomeChannel = client.channels.cache.get(CONFIG.CHANNELS.BIENVENIDAS);
@@ -169,7 +188,6 @@ async function sendWelcomeNotification(member, inviter, inviteCode) {
         { name: '👥 Miembro número', value: `#${member.guild.memberCount}`, inline: true }
       )
       .setThumbnail(member.user.displayAvatarURL({ dynamic: true, size: 256 }))
-      .setImage('https://i.imgur.com/abcdefg.gif') // Puedes agregar un GIF de bienvenida
       .setTimestamp()
       .setFooter({ text: '¡Bienvenido al servidor! 🎊' });
 
@@ -229,9 +247,6 @@ async function updateInviterCount(userId, guildId, invitedMember = null) {
     
     console.log(`📊 Usuario ${userId} ahora tiene ${currentCount} invitaciones`);
     
-    // Guardar en "base de datos" simple
-    saveInvitesData();
-    
     await checkRankUp(userId, guildId, currentCount, invitedMember);
 
   } catch (error) {
@@ -250,9 +265,6 @@ async function addManualInvites(userId, guildId, cantidad, adminUser, reason = '
     
     console.log(`📝 Invitaciones manuales agregadas: ${userId} +${cantidad} = ${newCount} (por: ${adminUser.tag})`);
     
-    // Guardar datos
-    saveInvitesData();
-    
     // Notificar en logs
     await logAction(adminUser, `Agregó ${cantidad} invitaciones a <@${userId}> (Total: ${newCount}) - Razón: ${reason}`);
     
@@ -265,11 +277,6 @@ async function addManualInvites(userId, guildId, cantidad, adminUser, reason = '
     console.error('❌ Error agregando invitaciones manuales:', error.message);
     throw error;
   }
-}
-
-// GUARDAR DATOS DE INVITACIONES
-function saveInvitesData() {
-  console.log('💾 Datos de invitaciones actualizados (en memoria)');
 }
 
 // LOG DE ACCIONES
@@ -311,7 +318,6 @@ async function checkRankUp(userId, guildId, inviteCount, invitedMember = null) {
 
     let newRole = null;
     let oldRole = null;
-    let roleAction = null;
 
     // Lógica de asignación de roles
     if (inviteCount >= CONFIG.INVITACIONES.PLATINO && platinoRole && !hasPlatino) {
@@ -321,13 +327,11 @@ async function checkRankUp(userId, guildId, inviteCount, invitedMember = null) {
       }
       await member.roles.add(platinoRole);
       newRole = 'Platino';
-      roleAction = 'ascendido a';
       console.log(`🏆 Rol Platino asignado a ${member.user.tag}`);
 
     } else if (inviteCount >= CONFIG.INVITACIONES.ORO && oroRole && !hasOro && !hasPlatino) {
       await member.roles.add(oroRole);
       newRole = 'Oro';
-      roleAction = 'ascendido a';
       console.log(`🥇 Rol Oro asignado a ${member.user.tag}`);
     }
 
@@ -337,7 +341,7 @@ async function checkRankUp(userId, guildId, inviteCount, invitedMember = null) {
       
       // Log de ascenso
       await logAction(client.user, 
-        `🎉 <@${member.id}> fue ${roleAction} **${newRole}** por alcanzar ${inviteCount} invitaciones`
+        `🎉 <@${member.id}> fue ascendido a **${newRole}** por alcanzar ${inviteCount} invitaciones`
       );
     }
 
@@ -531,7 +535,6 @@ client.on('messageCreate', async (message) => {
       return message.reply('❌ Debes mencionar un canal. Ejemplo: `!setup welcome #bienvenidas`');
     }
 
-    // Aquí podrías guardar en base de datos, por ahora usamos variable de entorno
     const embed = new EmbedBuilder()
       .setColor('#00FF00')
       .setTitle('✅ Canal de Bienvenidas Configurado')
