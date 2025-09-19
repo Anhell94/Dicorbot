@@ -1,4 +1,4 @@
-const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, EmbedBuilder, PermissionsBitField } = require('discord.js');
 const express = require('express');
 
 // Configuración - USARÁ VARIABLES DE ENTORNO
@@ -9,7 +9,8 @@ const CONFIG = {
     PLATINO: process.env.ROL_PLATINO || '1418452624549875783'
   },
   CHANNELS: {
-    RECOMPENSAS: process.env.CHANNEL_RECOMPENSAS || '1418453783767158864'
+    RECOMPENSAS: process.env.CHANNEL_RECOMPENSAS || '1418453783767158864',
+    LOGS: process.env.CHANNEL_LOGS || '1418453783767158864'
   },
   INVITACIONES: {
     ORO: parseInt(process.env.INVITACIONES_ORO) || 5,
@@ -21,6 +22,8 @@ const CONFIG = {
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+app.use(express.json());
+
 app.get('/', (req, res) => {
   res.json({ 
     status: 'online', 
@@ -30,7 +33,6 @@ app.get('/', (req, res) => {
   });
 });
 
-// Health check endpoint para Render
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'healthy', 
@@ -124,7 +126,7 @@ async function trackInvite(member) {
     }
 
     if (inviter) {
-      await updateInviterCount(inviter.id, member.guild.id);
+      await updateInviterCount(inviter.id, member.guild.id, member);
     }
 
     // Actualizar cache
@@ -135,7 +137,7 @@ async function trackInvite(member) {
   }
 }
 
-async function updateInviterCount(userId, guildId) {
+async function updateInviterCount(userId, guildId, invitedMember = null) {
   try {
     const key = `${userId}-${guildId}`;
     const currentCount = (userInvites.get(key) || 0) + 1;
@@ -143,13 +145,74 @@ async function updateInviterCount(userId, guildId) {
     
     console.log(`📊 Usuario ${userId} ahora tiene ${currentCount} invitaciones`);
     
-    await checkRankUp(userId, guildId, currentCount);
+    // Guardar en "base de datos" simple
+    saveInvitesData();
+    
+    await checkRankUp(userId, guildId, currentCount, invitedMember);
+
   } catch (error) {
     console.error('❌ Error actualizando contador:', error.message);
   }
 }
 
-async function checkRankUp(userId, guildId, inviteCount) {
+// FUNCIÓN PARA AGREGAR INVITACIONES MANUALMENTE
+async function addManualInvites(userId, guildId, cantidad, adminUser, reason = 'Ajuste manual') {
+  try {
+    const key = `${userId}-${guildId}`;
+    const currentCount = userInvites.get(key) || 0;
+    const newCount = currentCount + cantidad;
+    
+    userInvites.set(key, newCount);
+    
+    console.log(`📝 Invitaciones manuales agregadas: ${userId} +${cantidad} = ${newCount} (por: ${adminUser.tag})`);
+    
+    // Guardar datos
+    saveInvitesData();
+    
+    // Notificar en logs
+    await logAction(adminUser, `Agregó ${cantidad} invitaciones a <@${userId}> (Total: ${newCount}) - Razón: ${reason}`);
+    
+    // Verificar ascenso de rango
+    await checkRankUp(userId, guildId, newCount);
+    
+    return newCount;
+    
+  } catch (error) {
+    console.error('❌ Error agregando invitaciones manuales:', error.message);
+    throw error;
+  }
+}
+
+// GUARDAR DATOS DE INVITACIONES
+function saveInvitesData() {
+  // En un entorno real, aquí guardarías en una base de datos
+  // Por ahora solo mantenemos en memoria para Render free
+  console.log('💾 Datos de invitaciones actualizados (en memoria)');
+}
+
+// LOG DE ACCIONES
+async function logAction(admin, message) {
+  try {
+    const logChannel = client.channels.cache.get(CONFIG.CHANNELS.LOGS);
+    if (logChannel) {
+      const embed = new EmbedBuilder()
+        .setColor('#3498db')
+        .setTitle('📝 Log del Sistema')
+        .setDescription(message)
+        .addFields(
+          { name: '🛠️ Moderador', value: `${admin.tag} (${admin.id})`, inline: true },
+          { name: '⏰ Fecha', value: new Date().toLocaleString(), inline: true }
+        )
+        .setTimestamp();
+
+      await logChannel.send({ embeds: [embed] });
+    }
+  } catch (error) {
+    console.error('❌ Error enviando log:', error.message);
+  }
+}
+
+async function checkRankUp(userId, guildId, inviteCount, invitedMember = null) {
   try {
     const guild = client.guilds.cache.get(guildId);
     if (!guild) return;
@@ -166,6 +229,7 @@ async function checkRankUp(userId, guildId, inviteCount) {
 
     let newRole = null;
     let oldRole = null;
+    let roleAction = null;
 
     // Lógica de asignación de roles
     if (inviteCount >= CONFIG.INVITACIONES.PLATINO && platinoRole && !hasPlatino) {
@@ -175,17 +239,24 @@ async function checkRankUp(userId, guildId, inviteCount) {
       }
       await member.roles.add(platinoRole);
       newRole = 'Platino';
+      roleAction = 'ascendido a';
       console.log(`🏆 Rol Platino asignado a ${member.user.tag}`);
 
     } else if (inviteCount >= CONFIG.INVITACIONES.ORO && oroRole && !hasOro && !hasPlatino) {
       await member.roles.add(oroRole);
       newRole = 'Oro';
+      roleAction = 'ascendido a';
       console.log(`🥇 Rol Oro asignado a ${member.user.tag}`);
     }
 
     // Enviar anuncio si hubo ascenso
     if (newRole) {
-      await sendAnnouncement(member, newRole, oldRole, inviteCount);
+      await sendAnnouncement(member, newRole, oldRole, inviteCount, invitedMember);
+      
+      // Log de ascenso
+      await logAction(client.user, 
+        `🎉 <@${member.id}> fue ${roleAction} **${newRole}** por alcanzar ${inviteCount} invitaciones`
+      );
     }
 
   } catch (error) {
@@ -193,7 +264,7 @@ async function checkRankUp(userId, guildId, inviteCount) {
   }
 }
 
-async function sendAnnouncement(member, newRank, oldRank, count) {
+async function sendAnnouncement(member, newRank, oldRank, count, invitedMember = null) {
   try {
     const channel = client.channels.cache.get(CONFIG.CHANNELS.RECOMPENSAS);
     if (!channel) {
@@ -214,6 +285,14 @@ async function sendAnnouncement(member, newRank, oldRank, count) {
       .setTimestamp()
       .setFooter({ text: 'Sistema de Recompensas por Invitaciones' });
 
+    if (invitedMember) {
+      embed.addFields({ 
+        name: '👤 Nuevo Miembro', 
+        value: `${invitedMember.user.tag}`, 
+        inline: true 
+      });
+    }
+
     await channel.send({ 
       content: `🎉 ¡Felicidades ${member.user}! 🎉`,
       embeds: [embed] 
@@ -226,10 +305,11 @@ async function sendAnnouncement(member, newRank, oldRank, count) {
   }
 }
 
-// Comandos del bot
+// COMANDOS DEL BOT
 client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
 
+  // !invites - Ver tus propias invitaciones
   if (message.content === '!invites') {
     const key = `${message.author.id}-${message.guild.id}`;
     const count = userInvites.get(key) || 0;
@@ -247,16 +327,127 @@ client.on('messageCreate', async (message) => {
     message.reply({ embeds: [embed] });
   }
 
+  // !addinvites @usuario cantidad [razón] - AGREGAR INVITACIONES MANUALMENTE
+  if (message.content.startsWith('!addinvites')) {
+    // Verificar permisos de administrador
+    if (!message.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
+      return message.reply('❌ Necesitas permisos de administrador para usar este comando.');
+    }
+
+    const args = message.content.split(' ').slice(1);
+    if (args.length < 2) {
+      return message.reply('❌ Uso: `!addinvites @usuario cantidad [razón]`');
+    }
+
+    const userMention = args[0];
+    const cantidad = parseInt(args[1]);
+    const reason = args.slice(2).join(' ') || 'Ajuste administrativo';
+
+    // Validar cantidad
+    if (isNaN(cantidad) || cantidad <= 0) {
+      return message.reply('❌ La cantidad debe ser un número positivo.');
+    }
+
+    // Obtener usuario mencionado
+    const user = message.mentions.users.first();
+    if (!user) {
+      return message.reply('❌ Debes mencionar a un usuario válido.');
+    }
+
+    if (user.bot) {
+      return message.reply('❌ No puedes agregar invitaciones a bots.');
+    }
+
+    try {
+      // Agregar invitaciones manualmente
+      const newCount = await addManualInvites(
+        user.id, 
+        message.guild.id, 
+        cantidad, 
+        message.author,
+        reason
+      );
+
+      // Responder con confirmación
+      const embed = new EmbedBuilder()
+        .setColor('#00FF00')
+        .setTitle('✅ Invitaciones Agregadas')
+        .setDescription(`Se agregaron **${cantidad}** invitaciones a ${user.tag}`)
+        .addFields(
+          { name: '📊 Nuevo Total', value: `${newCount} invitaciones`, inline: true },
+          { name: '🛠️ Moderador', value: message.author.tag, inline: true },
+          { name: '📝 Razón', value: reason, inline: false }
+        )
+        .setTimestamp();
+
+      message.reply({ embeds: [embed] });
+
+    } catch (error) {
+      console.error('Error:', error);
+      message.reply('❌ Error al agregar invitaciones: ' + error.message);
+    }
+  }
+
+  // !checkinvites @usuario - VER INVITACIONES DE OTRO USUARIO
+  if (message.content.startsWith('!checkinvites')) {
+    if (!message.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
+      return message.reply('❌ Necesitas permisos de administrador para usar este comando.');
+    }
+
+    const args = message.content.split(' ').slice(1);
+    let targetUser;
+
+    if (args.length === 0) {
+      targetUser = message.author;
+    } else {
+      targetUser = message.mentions.users.first();
+      if (!targetUser) {
+        return message.reply('❌ Debes mencionar a un usuario válido.');
+      }
+    }
+
+    const key = `${targetUser.id}-${message.guild.id}`;
+    const count = userInvites.get(key) || 0;
+
+    const embed = new EmbedBuilder()
+      .setColor('#3498db')
+      .setTitle('📊 Invitaciones del Usuario')
+      .setDescription(`**${targetUser.tag}** tiene **${count}** invitaciones`)
+      .addFields(
+        { name: '🆔 User ID', value: targetUser.id, inline: true },
+        { name: '🥇 Para Oro', value: `${Math.max(0, CONFIG.INVITACIONES.ORO - count)} faltantes`, inline: true },
+        { name: '🏆 Para Platino', value: `${Math.max(0, CONFIG.INVITACIONES.PLATINO - count)} faltantes`, inline: true }
+      )
+      .setThumbnail(targetUser.displayAvatarURL({ dynamic: true }))
+      .setTimestamp();
+
+    message.reply({ embeds: [embed] });
+  }
+
+  // !help - AYUDA
   if (message.content === '!help') {
+    const isAdmin = message.member.permissions.has(PermissionsBitField.Flags.Administrator);
+
     const embed = new EmbedBuilder()
       .setColor('#0099FF')
-      .setTitle('🤖 Comandos del Bot')
-      .setDescription('Comandos disponibles:')
+      .setTitle('🤖 Comandos del Bot de Invitaciones')
+      .setDescription('Sistema de recompensas por invitar amigos al servidor')
       .addFields(
-        { name: '!invites', value: 'Muestra tus invitaciones actuales', inline: false },
-        { name: '!help', value: 'Muestra esta ayuda', inline: false }
-      )
-      .setFooter({ text: 'Sistema de Invitaciones' });
+        { name: '🎯 Comandos para todos', value: '```!invites - Ver tus invitaciones\n!help - Mostrar esta ayuda```', inline: false }
+      );
+
+    if (isAdmin) {
+      embed.addFields({
+        name: '🛠️ Comandos de Administrador',
+        value: '```!addinvites @usuario cantidad [razón] - Agregar invitaciones manualmente\n!checkinvites @usuario - Ver invitaciones de otro usuario```',
+        inline: false
+      });
+    }
+
+    embed.addFields(
+      { name: '🏆 Sistema de Rangos', value: `\`\`\`🥇 Oro: ${CONFIG.INVITACIONES.ORO} invitaciones\n🏆 Platino: ${CONFIG.INVITACIONES.PLATINO} invitaciones\`\`\``, inline: false },
+      { name: '📊 Funciones Automáticas', value: '```✅ Asigna rol "Iniciado" automáticamente\n✅ Detecta invitaciones automáticamente\n✅ Ascensos de rango automáticos\n✅ Anuncios en canal de recompensas```', inline: false }
+    );
 
     message.reply({ embeds: [embed] });
   }
